@@ -53,6 +53,17 @@ NON_VIDEO_FILE_INPUT_IDENTIFIERS = (
     " ! ",  # gstreamer pipe
 )
 
+# Tick-rate frame counters (where CAP_PROP_FPS reports a time-base tick rate such as 600 Hz
+# instead of the real frame rate) are produced by ffmpeg when remuxing into AVI. The cadence
+# probe below is therefore restricted to AVI containers: other containers report a usable FPS
+# directly, and probing files whose leading frames lack timestamps (e.g. MPEG-TS with missing
+# PTS, see issue #590) would derive a bogus rate from sparse timestamps.
+AVI_EXTENSIONS = (".avi",)
+
+
+def _is_avi_file(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in AVI_EXTENSIONS
+
 
 def _get_capture_api(path: str) -> int:
     """API preference to use when opening `path` with `cv2.VideoCapture`. This exists as a
@@ -85,6 +96,39 @@ def _get_aspect_ratio(cap: cv2.VideoCapture, epsilon: float = 0.0001) -> float:
     if abs(num) < epsilon or abs(den) < epsilon:
         return 1.0
     return num / den
+
+
+# Maximum number of frames scanned by `_probe_frame_cadence`. Frames whose timestamp OpenCV cannot
+# establish yet (e.g. the leading packets of an MPEG-TS with missing PTS) report POS_MSEC of zero,
+# so the probe keeps grabbing until it sees two timestamps or reaches this bound.
+_MAX_CADENCE_PROBE_FRAMES = 16
+
+
+def _probe_frame_cadence(cap: cv2.VideoCapture) -> float | None:
+    """Measure the real frame rate from frame presentation timestamps.
+
+    Some containers (notably AVI files remuxed by ffmpeg) expose a high *tick rate* through
+    `CAP_PROP_FPS` (e.g. 600 Hz for 23.976 fps content) while `CAP_PROP_POS_MSEC` still follows
+    the true frame cadence. This returns the rate derived from the first two frame timestamps,
+    or ``None`` if no usable timestamps are available (the caller keeps the reported FPS). The
+    capture position is left wherever the last `grab()` landed; callers must rewind afterwards.
+    """
+    first_ms: float | None = None
+    for _ in range(_MAX_CADENCE_PROBE_FRAMES):
+        if not cap.grab():
+            break
+        ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+        if ms <= 0.0:
+            continue
+        if first_ms is None:
+            first_ms = ms
+            continue
+        elapsed_ms = ms - first_ms
+        # Two timestamps separated by `elapsed_ms` span one frame interval (the frames at and
+        # after the first timestamp). Ignore non-positive deltas (non-monotonic timestamps).
+        if elapsed_ms > 0.0:
+            return 1000.0 / elapsed_ms
+    return None
 
 
 class VideoStreamCv2(VideoStream):
@@ -157,6 +201,33 @@ class VideoStreamCv2(VideoStream):
         self._max_decode_attempts = max_decode_attempts
         self._decode_failures = 0
         self._warning_displayed = False
+        # POS_MSEC (microseconds) reported for the first decoded frame, subtracted from every
+        # timestamp so the first frame is anchored at time 0 like the other backends. Decided
+        # lazily on the first sequential `read()` because some containers only establish
+        # timestamps then. Only meaningful while reading from the start: a seek lands on an
+        # arbitrary timestamp, so the origin must not be (re)captured there.
+        self._time_origin_us: int | None = None
+        # True while frames are read sequentially from the start of the stream. A seek jumps to
+        # an arbitrary timestamp and flips this off, preventing the seek position from being
+        # mistaken for the first-frame time origin.
+        self._sequential = True
+        # True after a seek on a tick-rate container. OpenCV counts real frames in POS_FRAMES
+        # during a sequential read, but reports *ticks* there after a seek, so `frame_number`
+        # must convert until the next sequential pass (seek(0)/reset) begins.
+        self._post_seek_tick_position = False
+        # Anchor for post-seek frame accounting on a tick-rate container. `_seek_anchor_ticks`
+        # is the raw POS_FRAMES value at the seek landing point and `_seek_anchor_frame` the
+        # 0-based frame the next read() returns minus one; afterwards each grab advances the tick
+        # counter and the real frame number by one, so real frames follow as
+        # anchor_frame + (raw_ticks - anchor_ticks).
+        self._seek_anchor_ticks: float | None = None
+        self._seek_anchor_frame: int | None = None
+        # Frame count corrected from a tick-rate counter (e.g. remuxed AVI); None means the raw
+        # CAP_PROP_FRAME_COUNT is used. Cached so `duration` stays stable after `close()`.
+        self._corrected_frame_count: int | None = None
+        # Whether the caller explicitly set a frame rate (disables the tick-rate probe and is
+        # preserved across `reset()`).
+        self._frame_rate_overridden = frame_rate is not None
 
         # `_open_capture` populates `_cap` and `_frame_rate`.
         self._open_capture(frame_rate)
@@ -228,6 +299,8 @@ class VideoStreamCv2(VideoStream):
         """Duration of the stream as a FrameTimecode, or None if non terminating."""
         if self._is_device:
             return None
+        if self._corrected_frame_count is not None:
+            return self.base_timecode + self._corrected_frame_count
         if self._closed:
             return self.base_timecode + math.trunc(self._closed_frame_count)
         return self.base_timecode + math.trunc(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -247,9 +320,30 @@ class VideoStreamCv2(VideoStream):
         # avoid frame-boundary rounding errors at common framerates like 24000/1001.
         if self._eof_timecode is not None:
             return self._eof_timecode
+        # Tick-rate containers (e.g. the remuxed AVI) expose POS_MSEC at the tick rate and reset
+        # it to zero near end of stream, so derive the presentation time from the real frame
+        # number at the actual frame rate instead of trusting the raw timestamp.
+        if self._capture_rate != self._frame_rate and self._has_grabbed:
+            return self._frame_number_timecode()
         ms = self._cap.get(cv2.CAP_PROP_POS_MSEC)
         time_base = Fraction(1, 1000000)
-        return Timecode(pts=round(ms * 1000), time_base=time_base)
+        pts = round(ms * 1000)
+        # Anchor the first decoded frame at time 0. Some containers (e.g. DTS-only AVI) report a
+        # nonzero timestamp for frame 1; subtracting it keeps first/last timecodes consistent with
+        # the PyAV and MoviePy backends.
+        if self._time_origin_us is not None:
+            pts -= self._time_origin_us
+        return Timecode(pts=pts, time_base=time_base)
+
+    def _frame_number_timecode(self) -> Timecode:
+        """Synthesize the presentation Timecode of the current frame from its real frame number
+        and the stream frame rate. Used for tick-rate containers whose raw POS_MSEC does not
+        reflect the frame cadence (and can reset to zero near end of stream)."""
+        fps = self._frame_rate
+        return Timecode(
+            pts=max(self.frame_number - 1, 0) * fps.denominator,
+            time_base=Fraction(1, fps.numerator),
+        )
 
     @property
     def position(self) -> FrameTimecode:
@@ -266,11 +360,35 @@ class VideoStreamCv2(VideoStream):
 
     @property
     def position_ms(self) -> float:
-        return self._cap.get(cv2.CAP_PROP_POS_MSEC)
+        # Tick-rate containers derive their position from the real frame number (see `timecode`),
+        # since the raw POS_MSEC uses the tick time base and can reset near end of stream.
+        if self._capture_rate != self._frame_rate and self._has_grabbed:
+            return max(self.frame_number - 1, 0) * 1000.0 / float(self._frame_rate)
+        ms = self._cap.get(cv2.CAP_PROP_POS_MSEC)
+        # Apply the same first-frame offset as `timecode` so the two stay consistent.
+        if self._time_origin_us is not None:
+            return max(0.0, ms - self._time_origin_us / 1000.0)
+        return ms
 
     @property
     def frame_number(self) -> int:
-        return math.trunc(self._cap.get(cv2.CAP_PROP_POS_FRAMES))
+        # POS_FRAMES counts actual decoded frames during a sequential read, even for tick-rate
+        # containers (only POS_MSEC and CAP_PROP_FPS use the tick time base). After a seek the
+        # counter still increments one per grab but its value is indexed in *ticks*, so recover
+        # the real frame number relative to the anchor recorded at the seek landing point.
+        raw = self._cap.get(cv2.CAP_PROP_POS_FRAMES)
+        if self._post_seek_tick_position:
+            if self._seek_anchor_ticks is not None and self._seek_anchor_frame is not None:
+                frame_num = self._seek_anchor_frame + math.trunc(
+                    raw - self._seek_anchor_ticks
+                )
+            else:
+                ticks_per_frame = float(self._capture_rate) / float(self._frame_rate)
+                frame_num = math.ceil(raw / ticks_per_frame - 1e-9)
+            if self._corrected_frame_count is not None:
+                frame_num = min(frame_num, self._corrected_frame_count)
+            return max(1, frame_num)
+        return math.trunc(raw)
 
     def seek(self, target: TimecodeLike):
         self._check_open()
@@ -283,13 +401,28 @@ class VideoStreamCv2(VideoStream):
         target_secs = (self.base_timecode + target).seconds
         self._has_grabbed = False
         self._eof_timecode = None
+        # A seek leaves the stream at an arbitrary timestamp, so subsequent reads must not
+        # (re)capture the first-frame time origin. Seeking back to frame 0 restores sequential
+        # reading; the origin captured on the original first frame still applies.
+        self._sequential = target_secs <= 0.0
+        # POS_FRAMES reports ticks rather than real frames after a seek on tick-rate containers.
+        self._post_seek_tick_position = (
+            target_secs > 0.0 and self._capture_rate != self._frame_rate
+        )
         if target_secs > 0:
-            # Seek one frame before target so the next read() returns the frame at target.
-            one_frame_ms = 1000.0 / float(self._frame_rate)
+            # Tick-rate containers (e.g. remuxed AVI) measure POS_MSEC/POS_FRAMES at the raw
+            # tick rate rather than the real frame rate. The wall-clock target time is still
+            # expressed in seconds, so seek in time as usual but size the one-frame backstep and
+            # the VFR correction window in *capture* ticks; frame numbers reported afterwards
+            # are converted back to real frames in the `frame_number` property.
+            one_frame_ms = 1000.0 / float(self._capture_rate)
             seek_ms = max(0.0, target_secs * 1000.0 - one_frame_ms)
             self._cap.set(cv2.CAP_PROP_POS_MSEC, seek_ms)
             self._has_grabbed = self._cap.grab()
-            if self._has_grabbed:
+            # The VFR correction assumes POS_MSEC shares the frame rate; on a tick-rate container
+            # it advances at the capture (tick) rate, so the loop would spuriously grab extra
+            # frames and overshoot the target. Frame numbers are converted back in `frame_number`.
+            if self._has_grabbed and self._capture_rate == self._frame_rate:
                 # VFR correction: set(CAP_PROP_POS_MSEC) converts time using avg_fps internally,
                 # which can land ~1s too early for VFR video. Read forward until we reach the
                 # intended position. The threshold (2x one_frame_ms) never triggers for CFR.
@@ -310,14 +443,27 @@ class VideoStreamCv2(VideoStream):
                 seek_pos = round(pos - 1.0)
                 self._cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, seek_pos))
                 self._has_grabbed = self._cap.grab()
+            # Record the seek anchor on a tick-rate container. The frame the next read() returns
+            # is the 1-based frame (target.frame_num + 1) while the raw counter sits at a tick
+            # value; storing both lets `frame_number` recover later frames as
+            # target.frame_num + (raw_tick - anchor_tick), since every grab advances the raw
+            # tick counter and the real frame number by exactly one.
+            if self._has_grabbed and self._capture_rate != self._frame_rate:
+                self._seek_anchor_ticks = self._cap.get(cv2.CAP_PROP_POS_FRAMES)
+                self._seek_anchor_frame = target.frame_num
         else:
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self._seek_anchor_ticks = None
+            self._seek_anchor_frame = None
 
     def reset(self):
         """Close and re-open the VideoStream (should be equivalent to calling `seek(0)`)."""
         self._check_open()
         self._cap.release()
-        self._open_capture(float(self._frame_rate))
+        # Re-open without a frame-rate override when the rate was auto-detected, so a tick-rate
+        # container is re-probed the same way it was on the initial open (e.g. an AVI whose
+        # CAP_PROP_FPS reports 600 Hz). An explicit override is preserved as-is.
+        self._open_capture(self._frame_rate if self._frame_rate_overridden else None)
 
     def close(self) -> None:
         """Close the video, releasing the underlying `cv2.VideoCapture`. Has no effect if the
@@ -327,7 +473,14 @@ class VideoStreamCv2(VideoStream):
             return
         # A released capture no longer reports the video's properties, so record them first.
         self._closed_frame_size = self.frame_size
-        self._closed_frame_count = self._cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        # Keep whatever frame count `duration` currently resolves to so it remains available
+        # after the capture is released.
+        if self._corrected_frame_count is not None:
+            self._closed_frame_count = self._corrected_frame_count
+        else:
+            self._closed_frame_count = math.trunc(
+                self._cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            )
         self._closed_aspect_ratio = self.aspect_ratio
         self._closed = True
         self._cap.release()
@@ -359,6 +512,12 @@ class VideoStreamCv2(VideoStream):
             self._eof_timecode = last_timecode
             return False
         self._has_grabbed = True
+        if self._sequential and self._time_origin_us is None:
+            first_ms = self._cap.get(cv2.CAP_PROP_POS_MSEC)
+            # Record the origin even when the first timestamp is still unknown (0.0): later
+            # frames then keep their raw timestamp instead of subtracting a value captured at
+            # an arbitrary position.
+            self._time_origin_us = round(first_ms * 1000) if first_ms > 0.0 else 0
         self._eof_timecode = None
         # Need to make sure we actually grabbed a frame before calling retrieve.
         if decode and self._has_grabbed:
@@ -414,16 +573,82 @@ class VideoStreamCv2(VideoStream):
         assert frame_rate is None or frame_rate > MAX_FPS_DELTA, (
             "Frame rate must be validated if set!"
         )
+        reported_rate = cap.get(cv2.CAP_PROP_FPS)
         if frame_rate is None:
-            frame_rate = cap.get(cv2.CAP_PROP_FPS)
+            frame_rate = reported_rate
             if frame_rate < MAX_FPS_DELTA:
                 raise FrameRateUnavailable()
 
         self._cap: cv2.VideoCapture = cap
         self._frame_rate: Fraction = framerate_to_fraction(frame_rate)
+        # The rate the capture itself applies when converting POS_MSEC to a frame position. This
+        # equals the frame rate except for tick-rate containers (e.g. remuxed AVI), where the
+        # capture uses the raw tick rate even though `frame_rate` reflects the real cadence.
+        self._capture_rate: Fraction = framerate_to_fraction(reported_rate)
         self._has_grabbed = False
         self._eof_timecode: Timecode | None = None
+        self._time_origin_us = None
+        self._sequential = True
+        self._post_seek_tick_position = False
+        self._seek_anchor_ticks = None
+        self._seek_anchor_frame = None
+        self._corrected_frame_count = None
+        # Remuxed AVI files expose a tick rate (e.g. 600 Hz) instead of the real frame rate.
+        # The check is limited to AVI containers: other formats report a usable FPS directly,
+        # and probing streams whose leading frames lack timestamps (e.g. MPEG-TS with missing
+        # PTS, see issue #590) would derive a bogus rate from sparse timestamps. An explicit
+        # frame-rate override always wins.
+        if (
+            not self._frame_rate_overridden
+            and input_is_video_file
+            and isinstance(self._path_or_device, str)
+            and _is_avi_file(self._path_or_device)
+            and reported_rate >= MAX_FPS_DELTA
+        ):
+            cadence = _probe_frame_cadence(cap)
+            # Rewind whatever frames the probe grabbed.
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            if cadence is not None and cadence > MAX_FPS_DELTA:
+                cadence_fraction = framerate_to_fraction(cadence)
+                reported_fraction = framerate_to_fraction(reported_rate)
+                # The reported rate only counts ticks when it differs substantially from the
+                # rate the frame timestamps imply (same 2x rule as the PyAV backend).
+                if float(reported_fraction) > 2.0 * float(cadence_fraction):
+                    logger.debug(
+                        "Reported frame rate %.3f fps is a tick rate; using %.3f fps derived"
+                        " from frame timestamps.",
+                        float(reported_fraction),
+                        float(cadence_fraction),
+                    )
+                    self._frame_rate = cadence_fraction
+                    self._correct_tick_frame_count(cadence_fraction, reported_fraction)
         cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1.0)  # https://github.com/opencv/opencv/issues/26795
+
+    def _correct_tick_frame_count(
+        self, actual_rate: Fraction, reported_rate: Fraction
+    ) -> None:
+        """Reinterpret `CAP_PROP_FRAME_COUNT` when the capture counts time-base ticks.
+
+        The counter still reflects the declared duration, so the shared non-exact rule converts
+        that duration to frames at the real frame rate via :meth:`FrameTimecode.from_duration`,
+        matching what the PyAV and MoviePy backends report for the same file.
+        """
+        tick_count = math.trunc(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if tick_count <= 0:
+            return
+        duration_secs = tick_count / float(reported_rate)
+        self._corrected_frame_count = FrameTimecode.from_duration(
+            duration_secs, actual_rate
+        ).frame_num
+        logger.debug(
+            "Frame counter reports %d ticks at %.3f Hz (%.3fs); correcting to %d frames"
+            " at %.3f fps.",
+            tick_count,
+            float(reported_rate),
+            duration_secs,
+            self._corrected_frame_count,
+            float(actual_rate),
+        )
 
 
 class VideoCaptureAdapter(VideoStream):

@@ -150,6 +150,19 @@ def framerate_to_fraction(fps: "FrameRate | numbers.Rational") -> Fraction:
     return Fraction(fps).limit_denominator(10000)
 
 
+def duration_in_frames(duration_secs: float, frame_rate: "FrameRate | Fraction") -> int:
+    """Convert a duration reported only in seconds into a whole number of frames.
+
+    Containers and capture APIs often report the duration as a float of seconds while the
+    backend only knows the nominal frame rate, so the frame count cannot be exact. Every
+    backend must apply the *same* conversion here (round half to even, matching
+    :meth:`FrameTimecode._seconds_to_frames`) to keep sharding frame ranges aligned across
+    backends. See :func:`FrameTimecode.from_duration`.
+    """
+    rate = frame_rate if isinstance(frame_rate, Fraction) else framerate_to_fraction(frame_rate)
+    return round(duration_secs * rate)
+
+
 class Interpolation(Enum):
     """Interpolation method used for image resizing. Based on constants defined in OpenCV."""
 
@@ -276,6 +289,21 @@ class FrameTimecode:
             if timecode < 0:
                 raise ValueError("Timecode frame number must be positive and greater than zero.")
             self._time = _FrameNumber(timecode)
+
+    @classmethod
+    def from_duration(
+        cls, duration_secs: float, fps: "float | FrameTimecode | Fraction"
+    ) -> "FrameTimecode":
+        """Build a frame-accurate :class:`FrameTimecode` from a duration reported only in seconds.
+
+        This is the shared fallback every backend uses when the container cannot provide an
+        exact frame count (e.g. an AVI remux whose frame counter stores time-base ticks, or an
+        MPEG-TS with no frame count). The seconds are converted to a whole number of frames via
+        :func:`duration_in_frames` and stored as an exact frame number, so the returned
+        timecode is indistinguishable from one built from an exact count and stays consistent
+        across all backends given the same `duration_secs` and `fps`.
+        """
+        return cls(duration_in_frames(duration_secs, cls._ensure_fractional(fps)), fps)
 
     @property
     def frame_num(self) -> int:

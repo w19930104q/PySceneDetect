@@ -133,3 +133,77 @@ def test_decode_failures_exposed(corrupt_video_file: str):
         pass
     assert adapter.decode_failures == adapter._decode_failures
     assert adapter.decode_failures >= 0
+
+
+def test_avi_tick_rate_corrected_to_real_frame_rate(test_no_pts_avi: str):
+    """A remuxed AVI reports 600 Hz (a tick rate) through CAP_PROP_FPS even though the content
+    runs at ~24 fps. The backend must derive the real cadence from frame timestamps."""
+    raw = cv2.VideoCapture(test_no_pts_avi)
+    assert raw.get(cv2.CAP_PROP_FPS) == 600.0
+    raw.release()
+
+    stream = VideoStreamCv2(test_no_pts_avi)
+    try:
+        assert 23.0 < float(stream.frame_rate) < 25.0
+        # The tick counter (12012 at 600 Hz) is reinterpreted as the 480 real frames.
+        assert stream.duration is not None
+        assert stream.duration.frame_num == 480
+    finally:
+        stream.close()
+
+
+def test_avi_first_frame_anchored_at_zero(test_no_pts_avi: str):
+    """DTS-only AVI packets report a nonzero timestamp for the first frame via POS_MSEC; the
+    backend subtracts it so the first decoded frame sits at time 0 like the other backends."""
+    stream = VideoStreamCv2(test_no_pts_avi)
+    try:
+        assert stream.read(decode=False) is not False
+        assert stream.position == stream.base_timecode
+        assert stream.position_ms == pytest.approx(0.0, abs=0.1)
+        assert stream.frame_number == 1
+        # The origin is captured only while reading sequentially from the start.
+        assert stream._time_origin_us is not None and stream._time_origin_us > 0
+    finally:
+        stream.close()
+
+
+def test_avi_seek_does_not_recapture_time_origin(test_no_pts_avi: str):
+    """A seek lands on an arbitrary timestamp and must not replace the first-frame origin,
+    otherwise every later position would be shifted by the seek point."""
+    stream = VideoStreamCv2(test_no_pts_avi)
+    try:
+        assert stream.read(decode=False) is not False
+        origin = stream._time_origin_us
+        stream.seek(50)
+        assert stream._sequential is False
+        assert stream.read(decode=False) is not False
+        # The origin is unchanged and the position reflects the seek, not a re-anchored zero.
+        assert stream._time_origin_us == origin
+        assert stream.frame_number == 51
+        # Seeking back to the start restores sequential reading.
+        stream.seek(0)
+        assert stream._sequential is True
+    finally:
+        stream.close()
+
+
+def test_normal_mp4_frame_rate_untouched(test_movie_clip: str):
+    """The tick-rate probe must not alter a normal MP4 whose CAP_PROP_FPS is already correct."""
+    stream = VideoStreamCv2(test_movie_clip)
+    try:
+        assert float(stream.frame_rate) == pytest.approx(23.976, abs=0.001)
+        assert stream._corrected_frame_count is None
+        assert stream.duration is not None
+        assert stream.duration.frame_num == 1980
+    finally:
+        stream.close()
+
+
+def test_explicit_frame_rate_disables_tick_probe(test_no_pts_avi: str):
+    """An explicit frame-rate override always wins and suppresses the automatic probe."""
+    stream = VideoStreamCv2(test_no_pts_avi, frame_rate=30.0)
+    try:
+        assert float(stream.frame_rate) == pytest.approx(30.0)
+        assert stream._corrected_frame_count is None
+    finally:
+        stream.close()

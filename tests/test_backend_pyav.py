@@ -26,6 +26,7 @@ import av
 import pytest
 
 from scenedetect import SceneManager
+from scenedetect.common import FrameTimecode
 from scenedetect.backends.pyav import (
     MAX_CONSECUTIVE_DECODE_FAILURES,
     MAX_SEEK_PROBE_FRAMES,
@@ -272,6 +273,37 @@ def test_duration_fallback_unset_time_base(
     assert stream.frame_number == 0
 
 
+def test_tick_count_detector_distinguishes_avi_from_vfr(
+    test_no_pts_avi: str, test_vfr_drop3_video: str, auto_close
+):
+    """`_frame_count_is_tick_count` must fire on the remuxed AVI (average rate 600 Hz vs a
+    ~24 fps nominal rate) but stay False on genuine VFR video, whose average rate stays within
+    a factor of two of the nominal rate even though `stream.frames` is an exact frame count."""
+    avi = auto_close(VideoStreamAv(test_no_pts_avi))
+    assert avi._frame_count_is_tick_count() is True
+    vfr = auto_close(VideoStreamAv(test_vfr_drop3_video))
+    assert vfr._frame_count_is_tick_count() is False
+
+
+def test_avi_duration_derived_from_seconds_not_ticks(test_no_pts_avi: str, auto_close):
+    """The AVI's 12012-tick `stream.frames` must not be used as a frame count: the duration is
+    instead derived from the ~20 s container duration via the shared seconds-to-frames rule,
+    yielding the real 480-frame length."""
+    stream = auto_close(VideoStreamAv(test_no_pts_avi))
+    assert stream._video_stream.frames == 12012
+    assert stream._get_duration() == 480
+    assert stream.duration.frame_num == 480
+    assert isinstance(stream.duration, FrameTimecode)
+
+
+def test_duration_keeps_exact_frame_count_for_normal_video(test_video_file: str, auto_close):
+    """When `stream.frames` counts real frames (average rate in line with the nominal rate) it
+    must still be used directly rather than being re-derived from the duration."""
+    stream = auto_close(VideoStreamAv(test_video_file))
+    assert stream._frame_count_is_tick_count() is False
+    assert stream._get_duration() == stream._video_stream.frames == 720
+
+
 #
 # Streams without presentation timestamps
 #
@@ -361,8 +393,9 @@ def test_no_pts_avi_reopen(test_no_pts_avi: str, auto_close):
         frames += 1
         assert stream.position > previous
         previous = stream.position
-    # Not compared to `stream.duration`: this AVI declares a 600 Hz stream rate, so ffmpeg (and
-    # OpenCV) report its frame count in ticks. See the TODO in `VideoStreamAv._get_duration`.
+    # Not compared to `stream.duration`: `duration` now reports the corrected 480-frame length
+    # (see `test_avi_duration_derived_from_seconds_not_ticks`), while this loop reads only the
+    # frames actually decoded; assert the decode count directly instead.
     assert frames == _BFRAMES_NUM_FRAMES
 
 

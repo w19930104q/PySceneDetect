@@ -652,20 +652,38 @@ class VideoStreamAv(VideoStream):
         """Duration of one frame at the nominal frame rate in `time_base` ticks (at least 1)."""
         return max(round(1 / (self.frame_rate * time_base)), 1)
 
+    def _frame_count_is_tick_count(self) -> bool:
+        """True if `stream.frames` counts time-base ticks rather than actual video frames.
+
+        Some containers (notably AVI files remuxed by ffmpeg) store the stream duration as a
+        frame count in a high-rate time base (e.g. 1/600), so the demuxer reports both
+        `stream.frames` and `stream.duration` in ticks (e.g. 12012 for a 480-frame, 20 s clip).
+        The codec frame rate (`self.frame_rate`) still reflects the real cadence, so the tick
+        rate shows up as an `average_rate` far above it. A genuine VFR video can also have an
+        average rate above the nominal (guessed) rate, but it stays within a factor of two; the
+        remuxed AVI reports rates an order of magnitude higher, hence the 2x threshold.
+        """
+        average_rate = self._video_stream.average_rate
+        if not average_rate or not self.frame_rate:
+            return False
+        return float(average_rate) > 2.0 * float(self.frame_rate)
+
     def _get_duration(self) -> int:
         """Get video duration as number of frames based on the video and set framerate.
 
-        See https://pyav.org/docs/develop/api/time.html for details on how ffmpeg/PyAV
-        handle time calculations internally and which time base to use.
+        When the demuxer reports an exact frame count it is used directly. It must only be
+        trusted if it counts real frames: remuxed AVI files report time-base ticks instead
+        (see `_frame_count_is_tick_count`), in which case all backends derive the count from
+        the reported duration in seconds via the shared rule in
+        :meth:`FrameTimecode.from_duration`. See https://pyav.org/docs/develop/api/time.html
+        for details on how ffmpeg/PyAV handle time calculations internally.
         """
         assert self.frame_rate is not None, "Frame rate must be set before calling _get_duration!"
-        # See if we can obtain the number of frames directly from the stream itself.
-        # TODO(https://scenedetect.com/issues/590): Some AVI files remuxed by ffmpeg set the stream
-        # rate to a high tick rate (e.g. 600/1), causing `stream.frames` to report tick count
-        # rather than actual frame count (e.g. 12012 instead of 480). OpenCV reports the same value
-        # via CAP_PROP_FRAME_COUNT, but `duration_sec * frame_rate` would be more accurate when
-        # `stream.frames` disagrees with the stream duration and codec frame rate.
-        if self._video_stream.frames > 0:
+        # Use the frame count directly only when it counts actual frames. For some AVI files
+        # remuxed by ffmpeg the stream rate is set to a high tick rate (e.g. 600/1), causing
+        # `stream.frames` to report the tick count rather than the actual frame count
+        # (e.g. 12012 instead of 480); derive the count from duration seconds instead.
+        if self._video_stream.frames > 0 and not self._frame_count_is_tick_count():
             return self._video_stream.frames
         # Calculate based on the reported container duration.
         duration_sec = None
@@ -686,7 +704,7 @@ class VideoStreamAv(VideoStream):
                 return 0
             # `duration` is in units of `time_base`, so seconds = duration * time_base.
             duration_sec = float(self._video_stream.duration * _to_fraction(time_base))
-        return round(duration_sec * self.frame_rate)
+        return FrameTimecode.from_duration(duration_sec, self.frame_rate).frame_num
 
     def _handle_eof(self):
         """Fix for issue where if thread_type is 'AUTO' the whole video is not decoded.

@@ -684,3 +684,57 @@ def test_get_framerate():
     assert len(warning_info) == 1
     assert frame_rate == 30.0
     assert isinstance(frame_rate, float)
+
+
+#
+# Shared non-exact duration conversion (duration_in_frames / FrameTimecode.from_duration)
+#
+
+
+def test_duration_in_frames_rounds_half_to_even():
+    """The shared rule must use banker's rounding (round half to even), the same rounding
+    :class:`FrameTimecode` applies when converting seconds to frames, so every backend derives
+    the same frame count from the same reported seconds."""
+    from scenedetect.common import duration_in_frames
+
+    fps = Fraction(24000, 1001)
+    # An exact whole number of frames.
+    assert duration_in_frames(20.02, fps) == round(20.02 * fps)
+    # Half-integer frame counts round to the nearest even frame.
+    assert duration_in_frames(2.5 / fps, fps) == 2
+    assert duration_in_frames(3.5 / fps, fps) == 4
+    # Floats and Fractions describing the same rate give identical results.
+    assert duration_in_frames(9.5512, float(fps)) == duration_in_frames(9.5512, fps)
+
+
+def test_duration_in_frames_matches_seconds_to_frames():
+    """The helper must agree with FrameTimecode's own float-seconds conversion for arbitrary
+    inputs, which is the guarantee the backends rely on when falling back to a reported
+    duration in seconds."""
+    from scenedetect.common import duration_in_frames
+
+    for fps in (24.0, 29.97, Fraction(24000, 1001), Fraction(30000, 1001)):
+        for seconds in (0.0, 1.0, 9.5512, 20.06, 82.5825):
+            via_helper = duration_in_frames(seconds, fps)
+            via_timecode = FrameTimecode(seconds, fps).frame_num
+            assert via_helper == via_timecode, (fps, seconds)
+
+
+def test_frame_timecode_from_duration_is_frame_accurate():
+    """`from_duration` must return a timecode stored as an exact frame number (not raw seconds),
+    so it is indistinguishable from a timecode built from an exact frame count."""
+    fps = Fraction(24000, 1001)
+    timecode = FrameTimecode.from_duration(20.02, fps)
+    assert isinstance(timecode, FrameTimecode)
+    assert timecode.frame_num == 480
+    # The stored representation is an exact frame number, so adding it to a base timecode behaves
+    # like frame-based arithmetic rather than carrying residual float seconds.
+    assert (FrameTimecode(0, fps) + timecode).frame_num == 480
+    assert timecode.frame_rate == fps
+
+
+def test_frame_timecode_from_duration_zero_and_negative_guard():
+    """A zero/near-zero duration degrades to a zero-frame timecode instead of failing."""
+    assert FrameTimecode.from_duration(0.0, 24.0).frame_num == 0
+    # Tiny positive durations still round down to zero rather than raising.
+    assert FrameTimecode.from_duration(1e-12, 24.0).frame_num == 0

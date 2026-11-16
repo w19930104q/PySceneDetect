@@ -115,13 +115,19 @@ class VideoStreamMoviePy(VideoStream):
         )
 
         self._path: str = os.fspath(path)
-        # TODO: Need to map errors based on the strings, since several failure
-        # cases return IOErrors (e.g. could not read duration/video resolution). These
-        # should be mapped to specific errors, e.g. write a function to map MoviePy
-        # exceptions to a new set of equivalents.
-        self._reader = _retry_on_oserror(
-            "open", lambda: FFMPEG_VideoReader(self._path, print_infos=print_infos)
-        )
+        # MoviePy parses ffmpeg's reported `fps` by default, which is a *tick rate* for some
+        # remuxed containers (e.g. AVI files report 600 Hz for 23.976 fps content). Prefer the
+        # stream base rate (`tbr`), which reflects the real frame cadence; fall back to the
+        # default `fps` source on older MoviePy versions that do not accept `fps_source`.
+        try:
+            self._reader = _retry_on_oserror(
+                "open",
+                lambda: FFMPEG_VideoReader(self._path, print_infos=print_infos, fps_source="tbr"),
+            )
+        except TypeError:
+            self._reader = _retry_on_oserror(
+                "open", lambda: FFMPEG_VideoReader(self._path, print_infos=print_infos)
+            )
         # This will always be one behind self._reader.lastread when we finally call read()
         # as MoviePy caches the first frame when opening the video. Thus self._last_frame
         # will always be the current frame, and self._reader.lastread will be the next.
@@ -173,7 +179,12 @@ class VideoStreamMoviePy(VideoStream):
     def duration(self) -> FrameTimecode | None:
         """Duration of the stream as a FrameTimecode, or None if non terminating."""
         assert isinstance(self._reader.infos["duration"], float)
-        return self.base_timecode + self._reader.infos["duration"]
+        # The reader only reports duration in seconds, so apply the shared non-exact rule
+        # (round to the nearest whole frame) like the other backends instead of constructing a
+        # timecode carrying a raw float of seconds.
+        return self.base_timecode + FrameTimecode.from_duration(
+            self._reader.infos["duration"], self.frame_rate
+        )
 
     @property
     def aspect_ratio(self) -> float:
@@ -256,7 +267,10 @@ class VideoStreamMoviePy(VideoStream):
                 raise SeekError("MoviePy > 2.0 does not have proper EOF semantics (#461).")
             self._frame_number = min(
                 target.frame_num,
-                FrameTimecode(self._reader.infos["duration"], self.frame_rate).frame_num - 1,
+                FrameTimecode.from_duration(
+                    self._reader.infos["duration"], self.frame_rate
+                ).frame_num
+                - 1,
             )
             success = True
         except OSError as ex:
@@ -274,15 +288,23 @@ class VideoStreamMoviePy(VideoStream):
                 self.reset()
 
     def reset(self, print_infos=False):
-        """Close and re-open the VideoStream (should be equivalent to calling `seek(0)`)."""
+        """Close and re-open the VideoStream (should be equivalent to seeking to the start)."""
         self._check_open()
         self._last_frame = False
         self._last_frame_rgb = None
         self._frame_number = 0
         self._eof = False
-        self._reader = _retry_on_oserror(
-            "reset", lambda: FFMPEG_VideoReader(self._path, print_infos=print_infos)
-        )
+        try:
+            self._reader = _retry_on_oserror(
+                "reset",
+                lambda: FFMPEG_VideoReader(
+                    self._path, print_infos=print_infos, fps_source="tbr"
+                ),
+            )
+        except TypeError:
+            self._reader = _retry_on_oserror(
+                "reset", lambda: FFMPEG_VideoReader(self._path, print_infos=print_infos)
+            )
 
     def close(self) -> None:
         """Close the video, terminating the ffmpeg process used to decode it. Has no effect if
