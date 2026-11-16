@@ -23,6 +23,40 @@ from scenedetect._fan_out import FanOutVideoStream
 from scenedetect.video_stream import SeekError
 
 
+class _FailingSource:
+    """VideoStream proxy whose read() raises after ``fail_after`` successful frames."""
+
+    def __init__(self, video, fail_after: int):
+        self._video = video
+        self._fail_after = fail_after
+        self._reads = 0
+
+    def read(self, decode: bool = True):
+        self._reads += 1
+        if self._reads == self._fail_after + 1:
+            raise OSError("injected reader failure")
+        return self._video.read(decode=decode)
+
+    def __getattr__(self, name):
+        return getattr(self._video, name)
+
+
+class _FailingDetector:
+    """Detector stand-in that raises after a fixed number of processed frames."""
+
+    def __init__(self, fail_after: int = 12):
+        self._inner = ContentDetector()
+        self._fail_after = fail_after
+
+    def process_frame(self, frame_num, frame_img):
+        if frame_num == self._fail_after:
+            raise RuntimeError("injected consumer failure")
+        return self._inner.process_frame(frame_num, frame_img)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def _read_all(stream) -> list[np.ndarray]:
     frames = []
     while True:
@@ -234,3 +268,158 @@ def test_fan_out_prefetch_zero_rendezvous(test_video_file):
         fan.close()
 
     assert results[0] == results[1] > 0
+
+
+def test_fan_out_consumer_failure_propagates_to_all(test_video_file, caplog):
+    """If one consumer fails, every sibling drains its buffer and then gets the same error."""
+    n_consumers = 4
+    failing_consumer = 2
+    source = open_video(test_video_file)
+    fan = FanOutVideoStream(source, n=n_consumers, prefetch=3)
+    fan.start()
+    errors: list[BaseException | None] = [None] * n_consumers
+    counts = [0] * n_consumers
+
+    def worker(i: int) -> None:
+        detector = _FailingDetector(fail_after=12) if i == failing_consumer else ContentDetector()
+        sm = SceneManager()
+        sm.add_detector(detector)
+        try:
+            sm.detect_scenes(video=fan.stream(i))
+        except BaseException as exc:
+            errors[i] = exc
+            fan.fail(exc, consumer=i)
+        counts[i] = fan.stream(i).frame_number
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_consumers)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30.0)
+        alive = [t.name for t in threads if t.is_alive()]
+    finally:
+        fan.close()
+
+    # SceneManager logs the injected fault from its own decode thread; it is expected here.
+    caplog.clear()
+    assert not alive, f"threads hung: {alive}"
+    assert fan._reader is not None and not fan._reader.is_alive()
+    assert isinstance(fan.error, RuntimeError)
+    assert str(fan.error) == "injected consumer failure"
+    # The first failure wins even though siblings may report their re-raised copy.
+    assert all(isinstance(e, RuntimeError) for e in errors)
+    # Every consumer processed at least the frames admitted before the fault.
+    assert min(counts) >= 12
+    # Repeated reads after the error keep raising, never block.
+    with pytest.raises(RuntimeError):
+        fan.stream(0).read()
+
+
+def test_fan_out_reader_failure_drains_buffered_frames(test_video_file):
+    """A source-reader exception reaches all consumers only after buffered frames drain."""
+    n_consumers = 3
+    source = _FailingSource(open_video(test_video_file), fail_after=20)
+    fan = FanOutVideoStream(source, n=n_consumers, prefetch=4)
+    fan.start()
+    errors: list[BaseException | None] = [None] * n_consumers
+    counts = [0] * n_consumers
+
+    def worker(i: int) -> None:
+        stream = fan.stream(i)
+        try:
+            while True:
+                frame = stream.read()
+                if frame is False:
+                    break
+                counts[i] += 1
+        except BaseException as exc:
+            errors[i] = exc
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_consumers)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30.0)
+        alive = [t.name for t in threads if t.is_alive()]
+    finally:
+        fan.close()
+
+    assert not alive, f"threads hung: {alive}"
+    assert fan._reader is not None and not fan._reader.is_alive()
+    assert isinstance(fan.error, OSError)
+    assert all(isinstance(e, OSError) for e in errors)
+    # No frame fanned out before the fault may be lost: counts match across consumers.
+    assert len(set(counts)) == 1
+    assert counts[0] >= 1
+
+
+def test_fan_out_abort_is_clean_eof_without_error(test_video_file):
+    """A plain abort() drains in-flight frames and ends every consumer on clean EOF."""
+    n_consumers = 3
+    source = open_video(test_video_file)
+    fan = FanOutVideoStream(source, n=n_consumers, prefetch=4)
+    fan.start()
+    counts = [0] * n_consumers
+    terminals: list[str] = []
+    started = threading.Barrier(n_consumers)
+
+    def worker(i: int) -> None:
+        stream = fan.stream(i)
+        started.wait()
+        try:
+            while True:
+                frame = stream.read()
+                if frame is False:
+                    terminals.append("eof")
+                    break
+                counts[i] += 1
+                if counts[i] == 15:
+                    fan.abort()
+        except BaseException as exc:
+            terminals.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_consumers)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30.0)
+        alive = [t.name for t in threads if t.is_alive()]
+    finally:
+        fan.close()
+
+    assert not alive, f"threads hung: {alive}"
+    assert fan._reader is not None and not fan._reader.is_alive()
+    assert terminals == ["eof"] * n_consumers
+    assert fan.error is None
+    # Every consumer reached at least the cancellation point (no dropped buffered frames).
+    assert min(counts) >= 15
+
+
+def test_fan_out_first_error_wins(test_video_file):
+    """fail() records only the first exception; later failures do not replace it."""
+    source = open_video(test_video_file)
+    fan = FanOutVideoStream(source, n=2, prefetch=1)
+    fan.start()
+    try:
+        first = RuntimeError("first")
+        second = ValueError("second")
+        fan.fail(first, consumer=0)
+        fan.fail(second, consumer=1)
+        assert fan.error is first
+    finally:
+        fan.close()
+
+
+def test_fan_out_close_idempotent_and_joins_reader(test_video_file):
+    """close() stops the reader, is idempotent, and leaves no live reader behind."""
+    source = open_video(test_video_file)
+    fan = FanOutVideoStream(source, n=2)
+    fan.start()
+    # Consume a couple of frames so the reader has work in flight.
+    assert isinstance(fan.stream(0).read(), np.ndarray)
+    fan.close()
+    assert fan._reader is not None and not fan._reader.is_alive()
+    fan.close()  # must be a no-op, not raise

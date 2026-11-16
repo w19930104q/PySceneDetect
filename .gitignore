@@ -96,3 +96,7 @@ dmypy.json
 .pytype/
 cython_debug/
 test_clips/
+
+# Local isolated interpreter and dependency links (see .testenv/python3.14)
+.pydeps/
+.testenv/

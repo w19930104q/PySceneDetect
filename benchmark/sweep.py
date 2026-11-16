@@ -170,7 +170,10 @@ def _run_chunk(
             results[i] = (cuts, elapsed)
         except BaseException as exc:
             errors[i] = exc
-            fan.abort()
+            # Record the failure and request shutdown: the reader stops pulling new frames
+            # while every other consumer drains its buffered frames before receiving the
+            # same exception from its read().
+            fan.fail(exc, consumer=i)
 
     threads = [threading.Thread(target=worker, args=(i, p)) for i, p in enumerate(chunk)]
     try:
