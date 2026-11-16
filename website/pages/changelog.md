@@ -1,6 +1,14 @@
 
 # Releases
 
+## PySceneDetect 0.8 (In Development)
+
+#### API Changes
+
+ - [bugfix] `split_video_mkvmerge()` no longer leaves literal `$SCENE_NUMBER`, `$START_PTS`, `$END_PTS` (and the other per-scene variables) in output filenames. mkvmerge writes all parts from one shared output path and appends its own scene-number suffix, so per-scene variables cannot differ between its outputs and are now stripped (with any dangling separator) instead of being emitted verbatim. Use `split_video_ffmpeg()` for filenames that embed per-scene timecodes or PTS values.
+ - [bugfix] The single-scene `split_video_mkvmerge()` suffix now uses the same zero-padded width as the ffmpeg path, and scene-number width no longer loses a digit at exactly 1000 scenes (a `log10` floating-point rounding bug).
+ - [bugfix] `$START_PTS`/`$END_PTS` in `split_video_ffmpeg()` filenames are now computed from the exact presentation time (`pts * time_base`) instead of rounding floating-point seconds, matching the FFmetadata chapter export and avoiding VFR float drift.
+
 ## PySceneDetect 0.7
 
 ### PySceneDetect 0.7.3 (November 8, 2026)

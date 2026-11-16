@@ -30,13 +30,19 @@ from scenedetect import (
     open_video,
     save_images,
 )
+from scenedetect.common import Timecode
 from scenedetect.output import (
     SceneMetadata,
     VideoMetadata,
     _escape_ffmetadata,
     _open_output_file,
+    _strip_scene_variables,
+    default_formatter,
+    format_scene_number,
     is_ffmpeg_available,
     split_video_ffmpeg,
+    split_video_mkvmerge,
+    timecode_to_ms,
     write_scene_list,
     write_scene_list_edl,
     write_scene_list_fcp7,
@@ -44,6 +50,7 @@ from scenedetect.output import (
     write_scene_list_ffmetadata,
     write_scene_list_otio,
 )
+from scenedetect.output import video as video_output
 
 FFMPEG_ARGS = (
     "-vf crop=128:128:0:0 -map 0:v:0 -c:v libx264 -preset ultrafast -qp 0 -tune zerolatency"
@@ -102,7 +109,249 @@ def test_split_video_ffmpeg_formatter(tmp_path, test_movie_clip):
     assert len(entries) == len(scenes)
 
 
-# TODO: Add tests for `split_video_mkvmerge`.
+# ------------------------------------------------------------------
+# Shared naming helpers and mkvmerge/ffmpeg output-name conformance
+# ------------------------------------------------------------------
+
+
+def test_format_scene_number_width():
+    """Scene numbers use a shared zero-padded width, with no log10 float bug at powers of ten."""
+    assert format_scene_number(1, 0) == "001"
+    assert format_scene_number(3, 2) == "003"
+    assert format_scene_number(999, 998) == "999"
+    # floor(log10(1000)) + 1 used to evaluate to 3 due to floating-point rounding.
+    assert format_scene_number(1000, 0) == "0001"
+    assert format_scene_number(1000, 999) == "1000"
+    assert format_scene_number(1001, 1000) == "1001"
+
+
+def test_strip_scene_variables():
+    """Per-scene variables are removed for mkvmerge, together with dangling separators."""
+    cases = {
+        "$VIDEO_NAME-Scene-$SCENE_NUMBER.mkv": "$VIDEO_NAME-Scene.mkv",
+        "$VIDEO_NAME-Scene-$SCENE_NUMBER": "$VIDEO_NAME-Scene",
+        "$VIDEO_NAME-$START_PTS-$END_PTS.mkv": "$VIDEO_NAME.mkv",
+        "$VIDEO_NAME_$START_TIME$END_TIME.mkv": "$VIDEO_NAME.mkv",
+        "$VIDEO_NAME.mkv": "$VIDEO_NAME.mkv",
+        "clip-$SCENE_NUMBER-parts.mkv": "clip-parts.mkv",
+        # $VIDEO_NAME must survive untouched.
+        "$VIDEO_NAME-$SCENE_NUMBER.mkv": "$VIDEO_NAME.mkv",
+        # Brace form "${VAR}" is handled identically, with ${VIDEO_NAME} preserved.
+        "${VIDEO_NAME}-Scene-${SCENE_NUMBER}.mkv": "${VIDEO_NAME}-Scene.mkv",
+        "${VIDEO_NAME}-${START_PTS}-${END_PTS}.mkv": "${VIDEO_NAME}.mkv",
+        "$VIDEO_NAME-Scene-${SCENE_NUMBER}.mkv": "$VIDEO_NAME-Scene.mkv",
+        "clip-${SCENE_NUMBER}-parts.mkv": "clip-parts.mkv",
+    }
+    for template, expected in cases.items():
+        assert _strip_scene_variables(template) == expected, template
+
+
+def _vfr_scenes(test_vfr_video: str):
+    """Detect scenes on the fixed VFR sample and return the PTS-backed scene list."""
+    video = open_video(test_vfr_video, backend="pyav")
+    sm = SceneManager()
+    sm.add_detector(ContentDetector())
+    sm.detect_scenes(video=video, end_time=10.0)
+    scenes = sm.get_scene_list()
+    assert len(scenes) >= 2
+    return scenes
+
+
+def test_timecode_to_ms_uses_exact_pts():
+    """`$START_PTS`/`$END_PTS` come from the exact PTS instead of round(float seconds * 1000)."""
+    # pts=94094 at time_base=1/24000 -> 3920.5833... ms -> 3921 ms.
+    tc = FrameTimecode(Timecode(pts=94094, time_base=Fraction(1, 24000)), fps=Fraction(24000, 1001))
+    assert timecode_to_ms(tc) == round(tc.pts * tc.time_base * 1000) == 3921
+    # A non-integer millisecond value rounds to nearest, matching the filename formatter.
+    half = FrameTimecode(
+        Timecode(pts=12012, time_base=Fraction(1, 24000)), fps=Fraction(24000, 1001)
+    )
+    assert timecode_to_ms(half) == round(half.seconds * 1000)
+
+
+def test_default_formatter_pts_values_vfr(test_vfr_video: str):
+    """Formatted VFR filenames embed PTS milliseconds derived from the exact presentation time."""
+    scenes = _vfr_scenes(test_vfr_video)
+    video_name = Path(test_vfr_video).stem
+    metadata = VideoMetadata(name=video_name, path=Path(test_vfr_video), total_scenes=len(scenes))
+    formatter = default_formatter("$VIDEO_NAME-$SCENE_NUMBER-$START_PTS-$END_PTS.mp4")
+    for i, (start, end) in enumerate(scenes):
+        name = formatter(metadata, SceneMetadata(index=i, start=start, end=end))
+        expected_start = round(start.pts * start.time_base * 1000)
+        expected_end = round(end.pts * end.time_base * 1000)
+        assert name == (
+            f"{video_name}-{format_scene_number(len(scenes), i)}"
+            f"-{expected_start}-{expected_end}.mp4"
+        )
+        assert "$" not in name
+
+
+class _CommandRecorder:
+    """Stand-in for invoke_command that records each argv list without spawning a process."""
+
+    def __init__(self, monkeypatch):
+        self.calls: list[list[str]] = []
+        monkeypatch.setattr(video_output, "invoke_command", self._record)
+
+    def _record(self, args: list[str]) -> int:
+        self.calls.append(list(args))
+        return 0
+
+    @property
+    def output_path(self) -> Path:
+        call = self.calls[0]
+        return Path(call[call.index("-o") + 1])
+
+
+def test_split_video_mkvmerge_strips_scene_variables(test_vfr_video: str, tmp_path, monkeypatch):
+    """mkvmerge output names never contain literal `$...` placeholders (#backend conformance)."""
+    scenes = _vfr_scenes(test_vfr_video)
+    recorder = _CommandRecorder(monkeypatch)
+    split_video_mkvmerge(
+        test_vfr_video,
+        scenes,
+        output_dir=tmp_path,
+        output_file_template="$VIDEO_NAME-Scene-$SCENE_NUMBER-$START_PTS-$END_PTS.mkv",
+    )
+    assert len(recorder.calls) == 1
+    base_name = recorder.output_path.name
+    assert "$" not in base_name
+    # mkvmerge appends "-001", "-002", ... itself, so the -o base is the shared stem.
+    assert base_name == "goldeneye-vfr-Scene.mkv"
+    # The split ranges still carry the scene timecodes.
+    split_arg = recorder.calls[0][recorder.calls[0].index("--split") + 1]
+    assert split_arg.startswith("parts:")
+    assert split_arg.count(",") == len(scenes) - 1
+    for start, end in scenes:
+        assert f"{start.get_timecode()}-{end.get_timecode()}" in split_arg
+
+
+def test_split_video_mkvmerge_single_scene_suffix(test_vfr_video: str, tmp_path, monkeypatch):
+    """A single-scene mkvmerge split keeps the scene-number suffix the ffmpeg path also uses."""
+    scenes = _vfr_scenes(test_vfr_video)[:1]
+    recorder = _CommandRecorder(monkeypatch)
+    split_video_mkvmerge(
+        test_vfr_video,
+        scenes,
+        output_dir=tmp_path,
+        output_file_template="$VIDEO_NAME-Scene.mkv",
+    )
+    assert recorder.output_path.name == "goldeneye-vfr-Scene-001.mkv"
+
+
+def test_split_video_mkvmerge_single_scene_strips_pts_template(
+    test_vfr_video: str, tmp_path, monkeypatch
+):
+    """Even with a PTS template, the single-scene output has no leftover placeholders."""
+    scenes = _vfr_scenes(test_vfr_video)[:1]
+    recorder = _CommandRecorder(monkeypatch)
+    split_video_mkvmerge(
+        test_vfr_video,
+        scenes,
+        output_dir=tmp_path,
+        output_file_template="$VIDEO_NAME-Scene-$SCENE_NUMBER-$START_PTS-$END_PTS.mkv",
+    )
+    name = recorder.output_path.name
+    assert "$" not in name
+    assert name == "goldeneye-vfr-Scene-001.mkv"
+
+
+def test_split_video_backend_names_conform_on_default_template(
+    test_vfr_video: str, tmp_path, monkeypatch
+):
+    """For the default template the ffmpeg per-scene stems equal the mkvmerge base + suffixes."""
+    scenes = _vfr_scenes(test_vfr_video)
+
+    ffmpeg_recorder = _CommandRecorder(monkeypatch)
+    split_video_ffmpeg(
+        test_vfr_video,
+        scenes,
+        output_dir=tmp_path / "ff",
+        output_file_template="$VIDEO_NAME-Scene-$SCENE_NUMBER.mp4",
+    )
+    ffmpeg_stems = [Path(call[-1]).stem for call in ffmpeg_recorder.calls]
+
+    mkv_recorder = _CommandRecorder(monkeypatch)
+    split_video_mkvmerge(
+        test_vfr_video,
+        scenes,
+        output_dir=tmp_path / "mk",
+        output_file_template="$VIDEO_NAME-Scene.mkv",
+    )
+    base_stem = mkv_recorder.output_path.stem
+    mkv_stems = [f"{base_stem}-{format_scene_number(len(scenes), i)}" for i in range(len(scenes))]
+
+    assert ffmpeg_stems == mkv_stems
+    # Extensions remain backend-specific.
+    assert all(Path(call[-1]).suffix == ".mp4" for call in ffmpeg_recorder.calls)
+    assert mkv_recorder.output_path.suffix == ".mkv"
+
+
+@pytest.mark.skipif(condition=not is_ffmpeg_available(), reason="ffmpeg is not available")
+def test_split_video_ffmpeg_vfr_pts_filenames(test_vfr_video: str, tmp_path):
+    """End-to-end ffmpeg split on the VFR sample writes exact PTS values into the filenames."""
+    scenes = _vfr_scenes(test_vfr_video)
+    template = "$VIDEO_NAME-Scene-$SCENE_NUMBER-$START_PTS-$END_PTS.mp4"
+    assert (
+        split_video_ffmpeg(
+            test_vfr_video,
+            scenes,
+            output_dir=tmp_path,
+            output_file_template=template,
+            arg_override=FFMPEG_ARGS,
+        )
+        == 0
+    )
+    for i, (start, end) in enumerate(scenes):
+        expected_name = (
+            f"goldeneye-vfr-Scene-{format_scene_number(len(scenes), i)}"
+            f"-{round(start.pts * start.time_base * 1000)}"
+            f"-{round(end.pts * end.time_base * 1000)}.mp4"
+        )
+        assert (tmp_path / expected_name).exists(), expected_name
+
+
+def test_split_video_empty_scene_list_is_noop(monkeypatch, tmp_path, test_vfr_video: str):
+    """Both backends return 0 without invoking anything when there are no scenes."""
+    recorder = _CommandRecorder(monkeypatch)
+    assert split_video_ffmpeg(test_vfr_video, [], output_dir=tmp_path) == 0
+    assert split_video_mkvmerge(test_vfr_video, [], output_dir=tmp_path) == 0
+    assert recorder.calls == []
+
+
+def test_cli_split_video_mkvmerge_strips_pts_template(test_vfr_video: str, tmp_path, monkeypatch):
+    """The full `split-video -m` CLI path never emits literal per-scene variables (#606).
+
+    Exercises the CLI template pre-processing in addition to `split_video_mkvmerge`, so a
+    regression in either layer leaves a `$...` placeholder or doubled separator in the output.
+    """
+    from tests.helpers import invoke_cli
+
+    # The CLI rejects -m at parse time unless mkvmerge looks installed; pretend it is.
+    monkeypatch.setattr("scenedetect._cli.context.is_mkvmerge_available", lambda: True)
+    recorder = _CommandRecorder(monkeypatch)
+    exit_code, _ = invoke_cli(
+        [
+            "-i",
+            test_vfr_video,
+            "-o",
+            str(tmp_path),
+            "detect-content",
+            "time",
+            "--end",
+            "10s",
+            "split-video",
+            "--mkvmerge",
+            "--filename",
+            "$VIDEO_NAME-Scene-$SCENE_NUMBER-$START_PTS-$END_PTS",
+        ]
+    )
+    assert exit_code == 0
+    assert len(recorder.calls) == 1
+    name = recorder.output_path.name
+    assert "$" not in name
+    assert name == "goldeneye-vfr-Scene.mkv"
+    assert recorder.calls[0][0] == "mkvmerge"
 
 
 def test_save_images(test_video_file, tmp_path: Path):

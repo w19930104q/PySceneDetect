@@ -31,7 +31,7 @@ available on the computer, depending on the specified command-line options.
 """
 
 import logging
-import math
+import re
 import time
 import typing as ty
 from collections.abc import Sequence
@@ -123,6 +123,68 @@ class SceneMetadata:
 
 PathFormatter = ty.Callable[[VideoMetadata, SceneMetadata], str]
 
+# Minimum number of digits used when formatting scene numbers (e.g. scene 1 -> "001").
+MIN_SCENE_NUMBER_DIGITS = 3
+
+# Template variables that describe a single scene rather than the whole video. mkvmerge cannot
+# expand these because it appends its own scene-number suffix to one shared output path.
+_SCENE_VARIABLES = (
+    "SCENE_NUMBER",
+    "START_TIME",
+    "END_TIME",
+    "START_FRAME",
+    "END_FRAME",
+    "START_PTS",
+    "END_PTS",
+)
+
+
+def _strip_scene_variables(template: str) -> str:
+    """Remove per-scene `$VARIABLE` placeholders from an output filename template.
+
+    mkvmerge derives every output name from one shared base path plus its own scene-number
+    suffix, so per-scene variables cannot differ between its outputs. A separator directly
+    before or after a removed variable is removed as well to avoid dangling or doubled
+    separators (e.g. ``"$VIDEO_NAME-Scene-$SCENE_NUMBER"`` -> ``"$VIDEO_NAME-Scene"`` and
+    ``"$VIDEO_NAME-$START_PTS-$END_PTS"`` -> ``"$VIDEO_NAME"``).
+    """
+    dot_pos = template.rfind(".")
+    stem = template if dot_pos < 0 else template[:dot_pos]
+    extension = "" if dot_pos < 0 else template[dot_pos:]
+    for variable in _SCENE_VARIABLES:
+        # Match both "$VAR" and "${VAR}". A separator between two variables is consumed with
+        # the first one, so chains collapse without dangling or doubled separators.
+        placeholder = rf"(?:{variable}|\{{{variable}\}})"
+        stem = re.sub(rf"[-_]\${placeholder}(?=[-_]|$)", "", stem)
+        stem = re.sub(rf"\${placeholder}[-_]?", "", stem)
+    return stem + extension
+
+
+def scene_number_width(total_scenes: int) -> int:
+    """Number of digits required to represent every scene number, never below
+    :data:`MIN_SCENE_NUMBER_DIGITS`."""
+    # Count digits directly instead of using `floor(log10(...)) + 1`: the latter loses a digit at
+    # exact powers of ten (e.g. 1000) due to floating-point rounding of log10().
+    width = len(str(max(total_scenes, 1)))
+    return max(MIN_SCENE_NUMBER_DIGITS, width)
+
+
+def format_scene_number(total_scenes: int, index: int) -> str:
+    """Format the 0-based scene `index` as a zero-padded, 1-based scene number whose width is
+    shared by every scene in the output (e.g. ``"001"`` for 3 scenes, ``"0001"`` for 1000)."""
+    return ("%0" + str(scene_number_width(total_scenes)) + "d") % (index + 1)
+
+
+def timecode_to_ms(timecode: FrameTimecode) -> int:
+    """Convert a timecode to a whole number of milliseconds.
+
+    Uses the exact presentation time (``pts * time_base``), which is precise for VFR video,
+    instead of deriving the value back from floating-point seconds. For CFR timecodes this is
+    equivalent to rounding the frame time (``frame_num / frame_rate``) since ``pts`` is the frame
+    number and ``time_base`` equals ``1 / frame_rate`` in that case.
+    """
+    return round(timecode.pts * timecode.time_base * 1000)
+
 
 def default_formatter(template: str) -> PathFormatter:
     """Formats filenames using a template string which allows the following variables:
@@ -130,22 +192,17 @@ def default_formatter(template: str) -> PathFormatter:
     `$VIDEO_NAME`, `$SCENE_NUMBER`, `$START_TIME`, `$END_TIME`, `$START_FRAME`, `$END_FRAME`,
     `$START_PTS`, `$END_PTS` (presentation timestamp in milliseconds, accurate for VFR video)
     """
-    MIN_DIGITS = 3
-
-    def format_scene_number(video: VideoMetadata, scene: SceneMetadata) -> str:
-        width = max(MIN_DIGITS, math.floor(math.log(video.total_scenes, 10)) + 1)
-        return ("%0" + str(width) + "d") % (scene.index + 1)
 
     def formatter(video: VideoMetadata, scene: SceneMetadata) -> str:
         return Template(template).safe_substitute(
             VIDEO_NAME=video.name,
-            SCENE_NUMBER=format_scene_number(video, scene),
+            SCENE_NUMBER=format_scene_number(video.total_scenes, scene.index),
             START_TIME=str(scene.start.get_timecode().replace(":", ";")),
             END_TIME=str(scene.end.get_timecode().replace(":", ";")),
             START_FRAME=str(scene.start.frame_num),
             END_FRAME=str(scene.end.frame_num),
-            START_PTS=str(round(scene.start.seconds * 1000)),
-            END_PTS=str(round(scene.end.seconds * 1000)),
+            START_PTS=str(timecode_to_ms(scene.start)),
+            END_PTS=str(timecode_to_ms(scene.end)),
         )
 
     return formatter
@@ -171,9 +228,13 @@ def split_video_mkvmerge(
         input_video_path: Path to the video to be split.
         scene_list : List of scenes as pairs of FrameTimecodes denoting the start/end times.
         output_dir: Directory to output videos. If not set, output will be in working directory.
-        output_file_template: Template to use for generating output files. Note that mkvmerge always
-            adds the suffix "-$SCENE_NUMBER" to the output paths. Only the $VIDEO_NAME variable
-            is supported by this function.
+        output_file_template: Template to use for generating output files. Only the `$VIDEO_NAME`
+            variable can differ per output: mkvmerge writes all parts from one shared output path
+            and appends the scene number prefixed with a dash (``"-001"``, ``"-002"``, ...) to
+            each file itself. Per-scene variables (`$SCENE_NUMBER`, `$START_TIME`, `$END_TIME`,
+            `$START_FRAME`, `$END_FRAME`, `$START_PTS`, `$END_PTS`) cannot be represented in
+            mkvmerge output names and are stripped (along with any adjacent separators) before
+            the path is passed to mkvmerge. Use :func:`split_video_ffmpeg` for per-scene names.
         video_name: Name of the video to be substituted in output_file_template for
             $VIDEO_NAME. If not specified, will be obtained from the filename.
         show_output: If False, adds the --quiet flag when invoking `mkvmerge`.
@@ -198,18 +259,24 @@ def split_video_mkvmerge(
     if video_name is None:
         video_name = Path(input_video_path).stem
 
-    # mkvmerge doesn't support adding scene metadata to filenames. It always adds the scene
-    # number prefixed with a dash to the filenames.
-    template = Template(output_file_template)
-    output_path = template.safe_substitute(VIDEO_NAME=video_name)
+    # mkvmerge takes a single output path and appends "-001", "-002", ... to every resulting
+    # file itself; it cannot name outputs differently per scene. Per-scene template variables
+    # ($SCENE_NUMBER, $START_PTS, ...) therefore cannot be represented in mkvmerge output names
+    # and are stripped from the template together with any separator that would be left dangling.
+    # mkvmerge's own suffixes are zero-padded to 3 digits, which matches the ffmpeg path's minimum
+    # width for up to 999 scenes; the single-scene suffix below uses the shared formatter width.
+    template = _strip_scene_variables(output_file_template)
+    output_path = Path(Template(template).safe_substitute(VIDEO_NAME=video_name))
     if output_dir:
         output_path = Path(output_dir) / output_path
-    output_path = Path(output_path)
     logger.info(f"Splitting video with mkvmerge, path template: {output_path}")
-    # If there is only one scene, mkvmerge omits the suffix for the output. To make the filenames
-    # consistent with the output when there are multiple scenes present, we append "-001".
+    # If there is only one scene, mkvmerge omits the scene-number suffix. Append it ourselves
+    # using the same width the formatter would have used so the name matches the multi-scene
+    # output (and the ffmpeg path) exactly.
     if len(scene_list) == 1:
-        output_path = output_path.with_stem(output_path.stem + "-001")
+        output_path = output_path.with_stem(
+            output_path.stem + "-" + format_scene_number(len(scene_list), 0)
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     call_list = ["mkvmerge"]
@@ -314,8 +381,6 @@ def split_video_ffmpeg(
 
     ret_val = 0
     ffmpeg_args = arg_override.split(" ")
-    scene_num_format = "%0"
-    scene_num_format += str(max(3, math.floor(math.log(len(scene_list), 10)) + 1)) + "d"
 
     if formatter is None:
         formatter = default_formatter(output_file_template)

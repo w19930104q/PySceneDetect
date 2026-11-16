@@ -1049,7 +1049,7 @@ Options
 
 .. option:: -m, --mkvmerge
 
-  Split video using mkvmerge. Faster than re-encoding, but less precise. If set, options other than :option:`-f/--filename <-f>`, :option:`-q/--quiet <-q>` and :option:`-o/--output <-o>` will be ignored. Note that mkvmerge automatically appends the $SCENE_NUMBER suffix.
+  Split video using mkvmerge. Faster than re-encoding, but less precise. If set, options other than :option:`-f/--filename <-f>`, :option:`-q/--quiet <-q>` and :option:`-o/--output <-o>` will be ignored. Note that mkvmerge automatically appends the $SCENE_NUMBER suffix; other per-scene filename variables ($START_PTS, $END_PTS, etc.) cannot differ between mkvmerge outputs and are removed from the filename.
 
 .. option:: --expand
 

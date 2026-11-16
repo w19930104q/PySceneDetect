@@ -1321,7 +1321,7 @@ Customized filenames:
     "-m",
     is_flag=True,
     flag_value=True,
-    help="Split video using mkvmerge. Faster than re-encoding, but less precise. If set, options other than -f/--filename, -q/--quiet and -o/--output will be ignored. Note that mkvmerge automatically appends the $SCENE_NUMBER suffix.{}".format(
+    help="Split video using mkvmerge. Faster than re-encoding, but less precise. If set, options other than -f/--filename, -q/--quiet and -o/--output will be ignored. Note that mkvmerge automatically appends the $SCENE_NUMBER suffix; other per-scene filename variables ($START_PTS, $END_PTS, etc.) cannot differ between mkvmerge outputs and are removed from the filename.{}".format(
         USER_CONFIG.get_help_string("split-video", "mkvmerge")
     ),
 )

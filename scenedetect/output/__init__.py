@@ -56,7 +56,13 @@ from scenedetect.output.video import (
     VideoMetadata as VideoMetadata,
 )
 from scenedetect.output.video import (
+    _strip_scene_variables as _strip_scene_variables,
+)
+from scenedetect.output.video import (
     default_formatter as default_formatter,
+)
+from scenedetect.output.video import (
+    format_scene_number as format_scene_number,
 )
 from scenedetect.output.video import (
     is_ffmpeg_available as is_ffmpeg_available,
@@ -69,6 +75,9 @@ from scenedetect.output.video import (
 )
 from scenedetect.output.video import (
     split_video_mkvmerge as split_video_mkvmerge,
+)
+from scenedetect.output.video import (
+    timecode_to_ms as timecode_to_ms,
 )
 from scenedetect.platform import BytePath, StrPath
 
